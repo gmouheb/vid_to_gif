@@ -1,7 +1,7 @@
 import os
 import time
+import tempfile
 from flask import Flask, request, render_template, send_from_directory, redirect, url_for, flash, session
-from moviepy import VideoFileClip
 from werkzeug.utils import secure_filename
 
 UPLOAD_FOLDER = 'uploads'
@@ -50,10 +50,51 @@ def delete_file_safely(file_path):
         return False
 
 
+def convert_video_to_gif(input_path, output_path, start_time=None, end_time=None, fps=10, width=None):
+    """Convert video to GIF using FFmpeg subprocess instead of loading whole video into memory"""
+    import subprocess
+    import shlex
+    
+    # Start building the FFmpeg command
+    cmd = ['ffmpeg', '-i', input_path]
+    
+    # Add start time if specified
+    if start_time is not None:
+        cmd.extend(['-ss', str(start_time)])
+    
+    # Add end time if specified (as duration from start)
+    if end_time is not None and start_time is not None:
+        duration = end_time - start_time
+        cmd.extend(['-t', str(duration)])
+    elif end_time is not None:
+        cmd.extend(['-to', str(end_time)])
+    
+    # Set framerate
+    cmd.extend(['-r', str(fps)])
+    
+    # Set width if specified (maintain aspect ratio)
+    if width is not None:
+        cmd.extend(['-vf', f'scale={width}:-1:flags=lanczos'])
+    
+    # Add output options for GIF
+    cmd.extend([
+        '-f', 'gif',
+        output_path
+    ])
+    
+    # Execute the command
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    
+    if result.returncode != 0:
+        raise Exception(f"FFmpeg error: {result.stderr}")
+    
+    return True
+
+
 @app.route('/', methods=['GET', 'POST'])
 def upload_file():
     if request.method == 'POST':
-        # Clean old files first
+        # Clean old files first to free up space
         clean_old_files(app.config['UPLOAD_FOLDER'])
         clean_old_files(app.config['OUTPUT_FOLDER'])
         clean_old_files(os.path.join('static', 'gifs'))
@@ -98,46 +139,53 @@ def upload_file():
                 flash('Invalid time format. Please use seconds (e.g., 10.5)')
                 return redirect(request.url)
 
-            # Save the uploaded file
+            # Create unique filenames using timestamp
             timestamp = int(time.time())
             filename = f"{timestamp}_{secure_filename(file.filename)}"
             input_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+            
+            # Save the uploaded file
             file.save(input_path)
 
             # Create output filename
             gif_filename = f"{os.path.splitext(filename)[0]}.gif"
             gif_path = os.path.join(app.config['OUTPUT_FOLDER'], gif_filename)
-
-            # Also save a copy to static folder for preview
             static_gif_path = os.path.join('static', 'gifs', gif_filename)
 
             try:
-                # Load the video file
-                clip = VideoFileClip(input_path)
+                # Convert video to GIF using FFmpeg
+                convert_video_to_gif(
+                    input_path=input_path,
+                    output_path=gif_path,
+                    start_time=start_time,
+                    end_time=end_time,
+                    fps=fps,
+                    width=width
+                )
 
-                # Apply time trimming if specified
-                if start_time is not None or end_time is not None:
-                    clip = clip.subclip(start_time, end_time)
+                # Instead of copying, just create a symlink to save disk space
+                # (Remove previous link first if it exists)
+                if os.path.exists(static_gif_path):
+                    os.remove(static_gif_path)
+                
+                # Determine relative path for symlink
+                rel_path = os.path.relpath(gif_path, os.path.dirname(static_gif_path))
+                os.symlink(rel_path, static_gif_path)
 
-                # Resize if width is specified
-                if width:
-                    clip = clip.resize(width=width)
-
-                # Write the GIF file with the specified fps
-                clip.write_gif(gif_path, fps=fps)
-
-                # Copy to static folder for preview
-                import shutil
-                shutil.copy2(gif_path, static_gif_path)
-
-                # Store filename in session for display and later cleanup
+                # Store minimal information in session
                 session['gif_filename'] = gif_filename
-                session['original_filename'] = file.filename
+                session['original_filename'] = os.path.basename(file.filename)
                 session['gif_size'] = os.path.getsize(gif_path) / (1024 * 1024)  # Size in MB
+                
+                # Store file paths for later cleanup
                 session['input_path'] = input_path
                 session['gif_path'] = gif_path
                 session['static_gif_path'] = static_gif_path
 
+                # Delete the uploaded video immediately if not needed anymore
+                # (uncomment if you don't need to keep originals)
+                # delete_file_safely(input_path)
+                
                 return redirect(url_for('result'))
 
             except Exception as e:
@@ -169,88 +217,45 @@ def result():
     )
 
 
-# @app.route('/gifs/<filename>')
-# def download_file(filename):
-#     """Send the file for download and schedule it for deletion"""
-#     # Get paths from session for deletion after download
-#     input_path = session.get('input_path')
-#     gif_path = session.get('gif_path')
-#     static_gif_path = session.get('static_gif_path')
-#
-#     # Send the file first
-#     response = send_from_directory(app.config['OUTPUT_FOLDER'], filename, as_attachment=True)
-#
-#     # Then delete the files
-#     try:
-#         # Delete all associated files
-#         if input_path:
-#             delete_file_safely(input_path)
-#
-#         if gif_path:
-#             delete_file_safely(gif_path)
-#
-#         if static_gif_path:
-#             delete_file_safely(static_gif_path)
-#
-#         # Clear the session data
-#         session.pop('gif_filename', None)
-#         session.pop('original_filename', None)
-#         session.pop('gif_size', None)
-#         session.pop('input_path', None)
-#         session.pop('gif_path', None)
-#         session.pop('static_gif_path', None)
-#
-#     except Exception as e:
-#         print(f"Error during file cleanup: {e}")
-#
-#     return response
-
 @app.route('/gifs/<filename>')
 def download_file(filename):
     """Send the file for download and delete uploaded and generated files"""
-
     # Send the file first
     response = send_from_directory(app.config['OUTPUT_FOLDER'], filename, as_attachment=True)
 
-    try:
-        # Get paths from session for deletion
-        input_path = session.get('input_path')
-        gif_path = session.get('gif_path')
-        static_gif_path = session.get('static_gif_path')
+    # Schedule cleanup for after response is sent
+    @response.call_on_close
+    def cleanup_after_download():
+        try:
+            # Get paths from session for deletion
+            input_path = session.get('input_path')
+            gif_path = session.get('gif_path')
+            static_gif_path = session.get('static_gif_path')
 
-        # Delete session-stored paths if they exist
-        if input_path:
-            delete_file_safely(input_path)
+            # Delete session-stored paths if they exist
+            if input_path:
+                delete_file_safely(input_path)
 
-        if gif_path:
-            delete_file_safely(gif_path)
+            if gif_path:
+                delete_file_safely(gif_path)
 
-        if static_gif_path:
-            delete_file_safely(static_gif_path)
+            if static_gif_path and os.path.islink(static_gif_path):
+                os.unlink(static_gif_path)
+            elif static_gif_path:
+                delete_file_safely(static_gif_path)
 
-        # Fallback: explicitly build and delete from filename
-        delete_file_safely(os.path.join(app.config['OUTPUT_FOLDER'], filename))
-        delete_file_safely(os.path.join('static', 'gifs', filename))
+            # Clear session data
+            session.pop('gif_filename', None)
+            session.pop('original_filename', None)
+            session.pop('gif_size', None)
+            session.pop('input_path', None)
+            session.pop('gif_path', None)
+            session.pop('static_gif_path', None)
 
-        # Try to infer and delete the input video from the timestamp in filename
-        timestamp = filename.split('_')[0]
-        for f in os.listdir(app.config['UPLOAD_FOLDER']):
-            if f.startswith(timestamp):
-                delete_file_safely(os.path.join(app.config['UPLOAD_FOLDER'], f))
-
-        # Clear session data
-        session.pop('gif_filename', None)
-        session.pop('original_filename', None)
-        session.pop('gif_size', None)
-        session.pop('input_path', None)
-        session.pop('gif_path', None)
-        session.pop('static_gif_path', None)
-
-    except Exception as e:
-        print(f"Error during file cleanup: {e}")
+        except Exception as e:
+            print(f"Error during file cleanup: {e}")
 
     return response
-
 
 
 @app.route('/preview/<filename>')
@@ -264,5 +269,17 @@ def request_entity_too_large(error):
     return redirect(url_for('upload_file')), 413
 
 
+# Register periodic cleanup function to run on each request
+@app.before_request
+def cleanup_before_request():
+    # Only run cleanup occasionally (1% of requests) to avoid overhead
+    import random
+    if random.random() < 0.01:
+        clean_old_files(app.config['UPLOAD_FOLDER'], max_age_hours=1)
+        clean_old_files(app.config['OUTPUT_FOLDER'], max_age_hours=1)
+        clean_old_files(os.path.join('static', 'gifs'), max_age_hours=1)
+
+
 if __name__ == '__main__':
-    app.run(debug=True)
+    # Set a low number of worker threads to reduce memory usage
+    app.run(debug=False, threaded=True, processes=1)
