@@ -11,7 +11,3 @@ This is a simple web application built with Flask that allows users to upload a 
 - Simple web-based GUI
 - Automatically saves GIFs for download
 
----
-
-## Project Structure
-
